@@ -111,10 +111,14 @@ if __name__ == '__main__':
             dynamic_axes.update(output_axes)
         if opt.grid:
             if opt.end2end:
-                model = End2EndOddity(model,opt.conf_thres,device,len(labels), topk=opt.topk)
                 output_names = ['boxes', 'scores']
-                shapes = [opt.batch_size, 25200, 4, 
-                          opt.batch_size, 25200, 2]
+                model = End2EndOddity(model,opt.conf_thres,device,len(labels), topk=opt.topk, batch_size=opt.batch_size)
+                if opt.topk:
+                    shapes = [opt.batch_size, opt.topk * opt.batch_size, 4, 
+                              opt.batch_size, opt.topk * opt.batch_size, 2]
+                else:
+                    shapes = [opt.batch_size, 25200, 4, 
+                              opt.batch_size, 25200, 2]
             else:
                 model.model[-1].concat = True
 

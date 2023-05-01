@@ -223,75 +223,9 @@ class ONNX_TRT(nn.Module):
         return num_det, det_boxes, det_scores, det_classes
 
 
-class End2End(nn.Module):
-    '''export onnx or tensorrt model with NMS operation.'''
-    def __init__(self, model, max_obj=100, iou_thres=0.45, score_thres=0.25, max_wh=None, device=None, n_classes=80):
-        super().__init__()
-        device = device if device else torch.device('cpu')
-        assert isinstance(max_wh,(int)) or max_wh is None
-        self.model = model.to(device)
-        self.model.model[-1].end2end = True
-        self.patch_model = ONNX_TRT if max_wh is None else ONNX_ORT
-        self.end2end = self.patch_model(max_obj, iou_thres, score_thres, max_wh, device, n_classes)
-        self.end2end.eval()
-
-    def forward(self, x):
-        x = self.model(x)
-        x = self.end2end(x)
-        return x
-
-
-class OddityOutTOPK(nn.Module):
-    '''onnx module with TensorRT NMS operation.'''
-    def __init__(self, score_thres=0.2, n_classes=80, top_k=1000, batch_size=4):
-        super().__init__()
-        self.background_class = -1
-        self.batch_size = batch_size
-        self.score_threshold = score_thres
-        self.n_classes = n_classes
-        self.top_k = top_k
-
-    @staticmethod
-    def xywh2xyxy(x):
-        # Convert nx4 boxes from [x, y, w, h] to [x1, y1, x2, y2] where xy1=top-left, xy2=bottom-right
-        y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
-        y[:, :, 0] = x[:, :, 0] - x[:, :, 2] / 2  # top left x
-        y[:, :, 1] = x[:, :, 1] - x[:, :, 3] / 2  # top left y
-        y[:, :, 2] = x[:, :, 0] + x[:, :, 2] / 2  # bottom right x
-        y[:, :, 3] = x[:, :, 1] + x[:, :, 3] / 2  # bottom right y
-        return y
-
-    def forward(self, x):
-        boxes = x[:, :, 0:4]
-        conf = x[:, :, 4:5]
-        scores = x[:, :, 5:]
-
-        if self.n_classes == 1:
-            scores = conf # for models with one class, cls_loss is 0 and cls_conf is always 0.5,
-                                 # so there is no need to multiplicate.
-        else:
-            scores *= conf  # conf = obj_conf * cls_conf
-
-        boxes = self.xywh2xyxy(boxes)
-
-        out_box = torch.zeros(size=(self.batch_size, self.top_k, 4))
-        out_conf = torch.zeros(size=(self.batch_size, self.top_k))
-
-        for idx, batch in enumerate(scores):
-            _, indices = batch[:, 0].topk(k=self.top_k, dim=0)
-            top_k_confs = torch.squeeze(batch[indices])
-            top_k_box = torch.squeeze(boxes[idx][indices])
-            out_box[idx] = top_k_box
-            out_conf[idx] = top_k_confs
-
-        # in [4,  25200, 6]
-        # out [4, top_k, 4], [4, top_k, 1]
-        return out_box, torch.unsqueeze(out_conf, dim=2)
-
-
 class OddityOut(nn.Module):
     '''onnx module with TensorRT NMS operation.'''
-    def __init__(self, score_thres=0.01, n_classes=2):
+    def __init__(self, score_thres=0.2, n_classes=2):
         super().__init__()
         self.background_class = -1,
         self.score_threshold = score_thres
@@ -336,16 +270,66 @@ class OddityOut(nn.Module):
         return boxes, scores
 
 
+class OddityOutTOPK(nn.Module):
+    '''onnx module with TensorRT NMS operation.'''
+    def __init__(self, score_thres=0.2, n_classes=80, top_k=1000, batch_size=4):
+        super().__init__()
+        self.background_class = -1
+        self.batch_size = batch_size
+        self.score_threshold = score_thres
+        self.n_classes = n_classes
+        self.top_k = top_k
+
+    @staticmethod
+    def xywh2xyxy(x):
+        # Convert nx4 boxes from [x, y, w, h] to [x1, y1, x2, y2] where xy1=top-left, xy2=bottom-right
+        y = x.clone() if isinstance(x, torch.Tensor) else np.copy(x)
+        y[:, :, 0] = x[:, :, 0] - x[:, :, 2] / 2  # top left x
+        y[:, :, 1] = x[:, :, 1] - x[:, :, 3] / 2  # top left y
+        y[:, :, 2] = x[:, :, 0] + x[:, :, 2] / 2  # bottom right x
+        y[:, :, 3] = x[:, :, 1] + x[:, :, 3] / 2  # bottom right y
+        return y
+
+    def forward(self, x):
+        print(x.shape)
+        boxes = x[:, :, 0:4]
+        conf = x[:, :, 4:5]
+        scores = x[:, :, 5:]
+
+        if self.n_classes == 1:
+            scores = conf # for models with one class, cls_loss is 0 and cls_conf is always 0.5,
+                                 # so there is no need to multiplicate.
+        else:
+            scores *= conf  # conf = obj_conf * cls_conf
+
+        boxes = self.xywh2xyxy(boxes)
+
+        out_box = torch.zeros(size=(self.batch_size, self.top_k, 4))
+        out_conf = torch.zeros(size=(self.batch_size, self.top_k))
+
+        for idx, batch in enumerate(scores):
+            _, indices = batch[:, 0].topk(k=self.top_k, dim=0)
+            top_k_confs = torch.squeeze(batch[indices])
+            top_k_box = torch.squeeze(boxes[idx][indices])
+            out_box[idx] = top_k_box
+            out_conf[idx] = top_k_confs
+
+        # in [4,  25200, 6]
+        # out [4, top_k, 4], [4, top_k, 1]
+        print(out_box.shape, torch.unsqueeze(out_conf, dim=2).shape)
+        return out_box, torch.unsqueeze(out_conf, dim=2)
+
+
 class End2EndOddity(nn.Module):
     '''export onnx or tensorrt model with NMS operation.'''
-    def __init__(self, model, score_thres=0.2, device=None, n_classes=80, topk=0):
+    def __init__(self, model, score_thres=0.2, device=None, n_classes=80, topk=0, batch_size=1):
         super().__init__()
         device = device if device else torch.device('cpu')
         self.model = model.to(device)
         self.model.model[-1].end2end = True
         if topk > 0:
             self.patch_model = OddityOutTOPK
-            self.end2end = self.patch_model(score_thres, n_classes, top_k=topk)
+            self.end2end = self.patch_model(score_thres, n_classes, top_k=topk, batch_size=batch_size)
         else:
             self.patch_model = OddityOut
             self.end2end = self.patch_model(score_thres, n_classes)
@@ -353,9 +337,26 @@ class End2EndOddity(nn.Module):
 
     def forward(self, x):
         x = self.model(x)
-        x = self.end2end(x[0])
+        x = self.end2end(x)
         return x
 
+
+class End2End(nn.Module):
+    '''export onnx or tensorrt model with NMS operation.'''
+    def __init__(self, model, max_obj=100, iou_thres=0.45, score_thres=0.25, max_wh=None, device=None, n_classes=80):
+        super().__init__()
+        device = device if device else torch.device('cpu')
+        assert isinstance(max_wh,(int)) or max_wh is None
+        self.model = model.to(device)
+        self.model.model[-1].end2end = True
+        self.patch_model = ONNX_TRT if max_wh is None else ONNX_ORT
+        self.end2end = self.patch_model(max_obj, iou_thres, score_thres, max_wh, device, n_classes)
+        self.end2end.eval()
+
+    def forward(self, x):
+        x = self.model(x)
+        x = self.end2end(x)
+        return x
 
 
 def attempt_load(weights, map_location=None):
@@ -382,5 +383,3 @@ def attempt_load(weights, map_location=None):
         for k in ['names', 'stride']:
             setattr(model, k, getattr(model[-1], k))
         return model  # return ensemble
-
-
