@@ -63,7 +63,7 @@ def exif_size(img):
 
 
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
-                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix=''):
+                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix='', shuffle=False, close_mosaic=False):
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
         dataset = LoadImagesAndLabels(path, imgsz, batch_size,
@@ -80,11 +80,12 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
     batch_size = min(batch_size, len(dataset))
     nw = min([os.cpu_count() // world_size, batch_size if batch_size > 1 else 0, workers])  # number of workers
     sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
-    loader = torch.utils.data.DataLoader if image_weights else InfiniteDataLoader
+    loader = torch.utils.data.DataLoader if image_weights or close_mosaic else InfiniteDataLoader
     # Use torch.utils.data.DataLoader() if dataset.properties will update during training else InfiniteDataLoader()
     dataloader = loader(dataset,
                         batch_size=batch_size,
                         num_workers=nw,
+                        shuffle=shuffle,
                         sampler=sampler,
                         pin_memory=True,
                         collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn)
@@ -410,12 +411,32 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.shapes = np.array(shapes, dtype=np.float64)
         self.img_files = list(cache.keys())  # update
         self.label_files = img2label_paths(cache.keys())  # update
+        one_vs_all = False
+        one_vs_delete = False
         if single_cls:
             for x in self.labels:
                 x[:, 0] = 0
+        elif one_vs_all:
+            for x in self.labels:
+                for sub in x:
+                    sub[0] = 1 if sub[0] != 0 else 0
+        elif one_vs_delete:
+            self.segments = list(self.segments)
+            for idx_i, x in enumerate(self.labels):
+                self.labels[idx_i] = x[x[:, 0] == 0]
+                new_segment = []
+                for segment_part, keep in zip(self.segments[idx_i], x[:, 0] == 0):
+                    #print(segment_part)
+                    #print(keep)
+                    if keep:
+                        new_segment.append(segment_part)
+                #print('labels len', self.labels[idx_i].shape)
+                #print('new seg len', len(new_segment))
+                    
+                self.segments[idx_i] = new_segment
 
         n = len(shapes)  # number of images
-        bi = np.floor(np.arange(n) / batch_size).astype(int)  # batch index
+        bi = np.floor(np.arange(n) / batch_size).astype(np.int)  # batch index
         nb = bi[-1] + 1  # number of batches
         self.batch = bi  # batch index of image
         self.n = n
@@ -443,7 +464,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 elif mini > 1:
                     shapes[i] = [1, 1 / mini]
 
-            self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(int) * stride
+            self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int) * stride
 
         # Cache images into memory for faster training (WARNING: large datasets may exceed system RAM)
         self.imgs = [None] * n
@@ -534,8 +555,9 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
     def __getitem__(self, index):
         index = self.indices[index]  # linear, shuffled, or image_weights
 
+        n_labels = len(self.labels[index].copy())
         hyp = self.hyp
-        mosaic = self.mosaic and random.random() < hyp['mosaic']
+        mosaic = self.mosaic and random.random() < hyp['mosaic'] and n_labels < 50  # ensure that images with lots of little people do not get mosaic
         if mosaic:
             # Load mosaic
             if random.random() < 0.8:
@@ -606,6 +628,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             labels[:, [1, 3]] /= img.shape[1]  # normalized width 0-1
 
         if self.augment:
+            # img, labels = self.albumentations(img, labels)  # uncomment for albumentations
+            # nL = len(labels)
             # flip up-down
             if random.random() < hyp['flipud']:
                 img = np.flipud(img)
@@ -1103,7 +1127,7 @@ def random_perspective(img, targets=(), segments=(), degrees=10, translate=.1, s
     return img, targets
 
 
-def box_candidates(box1, box2, wh_thr=2, ar_thr=20, area_thr=0.1, eps=1e-16):  # box1(4,n), box2(4,n)
+def box_candidates(box1, box2, wh_thr=2, ar_thr=100, area_thr=0.1, eps=1e-16):  # box1(4,n), box2(4,n)
     # Compute candidate boxes: box1 before augment, box2 after augment, wh_thr (pixels), aspect_ratio_thr, area_ratio
     w1, h1 = box1[2] - box1[0], box1[3] - box1[1]
     w2, h2 = box2[2] - box2[0], box2[3] - box2[1]
@@ -1200,7 +1224,7 @@ def pastein(image, labels, sample_labels, sample_images, sample_masks):
                 r_image = cv2.resize(sample_images[sel_ind], (r_w, r_h))
                 temp_crop = image[ymin:ymin+r_h, xmin:xmin+r_w]
                 m_ind = r_mask > 0
-                if m_ind.astype(np.int32).sum() > 60:
+                if m_ind.astype(np.int).sum() > 60:
                     temp_crop[m_ind] = r_image[m_ind]
                     #print(sample_labels[sel_ind])
                     #print(sample_images[sel_ind].shape)
@@ -1216,22 +1240,24 @@ def pastein(image, labels, sample_labels, sample_images, sample_masks):
     return labels
 
 class Albumentations:
-    # YOLOv5 Albumentations class (optional, only used if package is installed)
-    def __init__(self):
+    # YOLOv8 Albumentations class (optional, only used if package is installed)
+    def __init__(self, size=640):
         self.transform = None
         import albumentations as A
+        #check_version(A.__version__, '1.0.3', hard=True)  # version requirement
 
-        self.transform = A.Compose([
-            A.CLAHE(p=0.01),
-            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.01),
-            A.RandomGamma(gamma_limit=[80, 120], p=0.01),
+        T = [
+            A.RandomResizedCrop(height=size, width=size, scale=(0.8, 1.0), ratio=(0.9, 1.11), p=0.0),
             A.Blur(p=0.01),
             A.MedianBlur(p=0.01),
             A.ToGray(p=0.01),
-            A.ImageCompression(quality_lower=75, p=0.01),],
-            bbox_params=A.BboxParams(format='pascal_voc', label_fields=['class_labels']))
+            A.CLAHE(p=0.01),
+            A.RandomBrightnessContrast(p=0.0),
+            A.RandomGamma(p=0.0),
+            A.ImageCompression(quality_lower=75, p=0.0)]  # transforms
+        self.transform = A.Compose(T, bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels']))
 
-            #logging.info(colorstr('albumentations: ') + ', '.join(f'{x}' for x in self.transform.transforms if x.p))
+        #logging.info(colorstr('albumentations: ') + ', '.join(f'{x}' for x in self.transform.transforms if x.p))
 
     def __call__(self, im, labels, p=1.0):
         if self.transform and random.random() < p:
