@@ -291,7 +291,6 @@ class OddityOutTOPK(nn.Module):
         return y
 
     def forward(self, x):
-        print(x.shape)
         boxes = x[:, :, 0:4]
         conf = x[:, :, 4:5]
         scores = x[:, :, 5:]
@@ -312,11 +311,15 @@ class OddityOutTOPK(nn.Module):
             top_k_confs = torch.squeeze(batch[indices])
             top_k_box = torch.squeeze(boxes[idx][indices])
             out_box[idx] = top_k_box
-            out_conf[idx] = top_k_confs
+            if scores.shape[2] == 1:
+                out_conf[idx] = top_k_confs
+            else:
+                # If there is more than one output class we select the topk 
+                # highest entries of the zeroth class
+                out_conf[idx] = top_k_confs[:, 0]
 
-        # in [4,  25200, 6]
+        # in [4,  25200, (5 + n_classes)]
         # out [4, top_k, 4], [4, top_k, 1]
-        print(out_box.shape, torch.unsqueeze(out_conf, dim=2).shape)
         return out_box, torch.unsqueeze(out_conf, dim=2)
 
 
